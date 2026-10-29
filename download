@@ -1,0 +1,5 @@
+# Nunca subir datos personales ni respaldos
+*.json
+!manifest.webmanifest
+index-mis-datos.html
+privado/

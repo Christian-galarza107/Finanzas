@@ -666,7 +666,7 @@ const Engine = (() => {
 
   /** Interés sugerido para el próximo pago. Nunca se inventa: requiere tasa o cuotas fijas. */
   function suggestInterest(loan, balance, amount, ls) {
-    if (balance <= 0 || amount <= 0) return { interest: 0, basis: 'none' };
+    if (balance == null || balance <= 0 || amount <= 0) return { interest: 0, basis: 'none' };
     if (loan.rate > 0) {
       const f = FREQ[loan.frequency] || FREQ.mensual;
       const periodsPerYear = f.months ? 12 / f.months : f.days ? 365 / f.days : 12;
@@ -684,50 +684,57 @@ const Engine = (() => {
     return { interest: 0, basis: 'none' };
   }
 
+  /**
+   * Estado de un préstamo. Si el saldo no fue informado (initialBalance null),
+   * no se inventa: la deuda figura "sin informar" y la cuota se proyecta mes a mes
+   * hasta que se carguen el saldo o las cuotas restantes.
+   */
+  const OPEN_ENDED_MONTHS = 36;
   function loanState(loan, txs, today) {
     const pays = loanPayments(loan, txs);
-    let balance = loan.initialBalance || 0;
-    const history = [{ date: loan.createdDate || loan.nextDueDate || (pays[0]?.date) || today, balance }];
+    const known = loan.initialBalance != null;
+    let balance = known ? loan.initialBalance : null;
+    const history = known ? [{ date: loan.createdDate || loan.nextDueDate || (pays[0]?.date) || today, balance }] : [];
     let capitalPaid = 0, interestPaid = 0, cuotasSince = 0;
     for (const p of pays) {
       const capital = p.amount - (p.interest || 0);
       capitalPaid += capital; interestPaid += p.interest || 0;
-      balance -= capital;
+      if (known) { balance -= capital; history.push({ date: p.date, balance }); }
       if (p.paymentType === 'cuota') cuotasSince++;
-      history.push({ date: p.date, balance });
     }
     const cuotasPaid = (loan.paidBefore || 0) + cuotasSince;
     const total = loan.installments || null;
-    let remainingCount = total ? Math.max(0, total - cuotasPaid) : null;
-    const closed = balance <= 0 || (total && remainingCount === 0 && balance <= 0);
+    const remainingCount = total ? Math.max(0, total - cuotasPaid) : null;
+    const closed = known ? balance <= 0 : (total ? remainingCount === 0 : pays.some((p) => p.paymentType === 'cancelacion'));
     // Cronograma de vencimientos impagos
     const schedule = [];
-    let scheduleEstimated = false;
+    let scheduleEstimated = false, openEnded = false;
     const f = FREQ[loan.frequency];
     if (!closed && loan.nextDueDate && f && !f.none) {
       let count;
       if (f.once) count = 1;
       else if (total) count = remainingCount;
-      else if (loan.installmentAmount > 0) { count = Math.ceil(balance / loan.installmentAmount); scheduleEstimated = true; }
+      else if (loan.installmentAmount > 0 && known) { count = Math.ceil(balance / loan.installmentAmount); scheduleEstimated = true; }
+      else if (loan.installmentAmount > 0) { count = f.days ? Math.ceil(OPEN_ENDED_MONTHS * 30 / f.days) : Math.ceil(OPEN_ENDED_MONTHS / f.months); openEnded = true; }
       else count = 0;
       count = Math.min(count, 600);
       const anchor = D.parts(loan.nextDueDate).d;
       for (let i = 0; i < count; i++) {
         const date = nthDate(loan.nextDueDate, loan.frequency, (f.once ? 0 : cuotasSince) + i, anchor);
         if (!date) break;
-        let amount = f.once ? balance : loan.installmentAmount || 0;
+        let amount = f.once ? (known ? balance : loan.installmentAmount || 0) : loan.installmentAmount || 0;
         if (scheduleEstimated && i === count - 1) amount = balance - loan.installmentAmount * (count - 1);
         if (amount <= 0) continue;
         schedule.push({ date, amount, n: total ? cuotasPaid + i + 1 : null, of: total });
       }
     }
     return {
-      loan, payments: pays, balance, capitalPaid, interestPaid, cuotasPaid, total,
-      remainingCount, closed: balance <= 0, schedule, scheduleEstimated, history,
-      estCancel: schedule.length ? schedule[schedule.length - 1].date : null,
+      loan, payments: pays, balance, balanceKnown: known, capitalPaid, interestPaid, cuotasPaid, total,
+      remainingCount, closed, schedule, scheduleEstimated, openEnded, history,
+      estCancel: schedule.length && !openEnded ? schedule[schedule.length - 1].date : null,
       overdue: schedule.filter((s) => s.date < today),
       next: schedule[0] || null,
-      progress: loan.originalAmount > 0 ? Math.min(1, Math.max(0, 1 - balance / loan.originalAmount)) : null,
+      progress: known && loan.originalAmount > 0 ? Math.min(1, Math.max(0, 1 - balance / loan.originalAmount)) : null,
     };
   }
 
@@ -833,8 +840,9 @@ const Engine = (() => {
     const cards = state.cards.filter((c) => !c.archived).map((c) => cardState(c, state.txs, today));
     const loans = state.loans.filter((l) => !l.archived).map((l) => loanState(l, state.txs, today));
     const cardDebt = cards.reduce((s, c) => s + Math.max(0, c.debt), 0);
-    const loanDebt = loans.reduce((s, l) => s + Math.max(0, l.balance), 0);
-    return { cards, loans, cardDebt, loanDebt, total: cardDebt + loanDebt };
+    const loanDebt = loans.reduce((s, l) => s + (l.balanceKnown ? Math.max(0, l.balance) : 0), 0);
+    const unknownLoans = loans.filter((l) => !l.balanceKnown && !l.closed).length;
+    return { cards, loans, cardDebt, loanDebt, unknownLoans, total: cardDebt + loanDebt };
   }
 
   /* ---------------- Proyección ---------------- */
@@ -914,7 +922,8 @@ const Engine = (() => {
       if (loan.archived) continue;
       const ls = loanState(loan, state.txs, today);
       if (ls.closed) continue;
-      if (!ls.schedule.length && ls.balance > 0) warnings.push(`“${loan.creditor}” no tiene cuotas o vencimientos definidos: su saldo (${Money.format(ls.balance)}) no se incluye en la proyección.`);
+      if (!ls.schedule.length && (ls.balance > 0 || !ls.balanceKnown)) warnings.push(ls.balanceKnown ? `“${loan.creditor}” no tiene cuotas o vencimientos definidos: su saldo (${Money.format(ls.balance)}) no se incluye en la proyección.` : `“${loan.creditor}” no tiene cuota ni vencimiento definidos: no se incluye en la proyección.`);
+      else if (ls.openEnded) warnings.push(`“${loan.creditor}”: sin saldo ni cuotas restantes informados, la cuota se proyecta todos los meses. Completalo en Deudas y tarjetas.`);
       for (const s of ls.schedule) {
         push(s.date, { dir: 'out', amount: s.amount, label: `${loan.creditor}${s.n ? ` · cuota ${s.n}/${s.of}` : ''}`, group: 'prestamos', confirmed: !ls.scheduleEstimated, ref: { type: 'loan', id: loan.id } });
       }
@@ -1030,7 +1039,7 @@ const Engine = (() => {
 const Store = (() => {
   'use strict';
   const { D, Money } = Engine;
-  const SCHEMA = 1;
+  const SCHEMA = 2; // v2: préstamos con saldo sin informar (initialBalance null)
   const KEY = { meta: 'misFinanzas:meta', real: 'misFinanzas:v1:real', demo: 'misFinanzas:v1:demo' };
   const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 
@@ -1095,7 +1104,7 @@ const Store = (() => {
   /** Normaliza y completa campos para versiones futuras del esquema. */
   function migrate(s) {
     const base = emptyState();
-    s.schemaVersion = s.schemaVersion || 1;
+    s.schemaVersion = SCHEMA; // v1 → v2 no requiere cambios de datos
     for (const k of ['accounts', 'categories', 'txs', 'recurrings', 'loans', 'cards']) if (!Array.isArray(s[k])) s[k] = base[k];
     s.settings = Object.assign({}, base.settings, s.settings || {});
     s.settings.projection = Object.assign({}, base.settings.projection, s.settings.projection || {});
@@ -1463,6 +1472,7 @@ const App = (() => {
       <section class="card kpi"><h2 class="kpi-label">${icon('loan')}Deuda total</h2><p class="kpi-value">${amt(debt.total)}</p>
         <div class="kv"><span class="k">Tarjetas</span><span class="v">${amt(debt.cardDebt)}</span></div>
         <div class="kv"><span class="k">Préstamos y deudas</span><span class="v">${amt(debt.loanDebt)}</span></div>
+        ${debt.unknownLoans ? `<div class="kv"><span class="k warn">${debt.unknownLoans} préstamo${debt.unknownLoans > 1 ? 's' : ''} sin saldo informado</span><span class="v"><a href="#deudas" data-action="debt-tab" data-tab="prestamos">Completar</a></span></div>` : ''}
         <p class="note">Lo que todavía debés en total. No es un gasto del mes: se paga en cuotas y resúmenes.</p></section>
     </div>`;
 
@@ -1623,7 +1633,7 @@ const App = (() => {
     const summary = `<div class="grid grid-4 mb">
       <div class="box"><p class="lbl">Deuda total</p><p class="val">${esc(fmt(debt.total))}</p></div>
       <div class="box"><p class="lbl">Tarjetas</p><p class="val">${esc(fmt(debt.cardDebt))}</p></div>
-      <div class="box"><p class="lbl">Préstamos y deudas</p><p class="val">${esc(fmt(debt.loanDebt))}</p></div>
+      <div class="box"><p class="lbl">Préstamos y deudas</p><p class="val">${esc(fmt(debt.loanDebt))}</p>${debt.unknownLoans ? `<p class="sub warn">${debt.unknownLoans} sin saldo informado</p>` : ''}</div>
       <div class="box"><p class="lbl">A pagar este mes</p><p class="val ${thisMonth ? 'warn' : ''}">${esc(fmt(thisMonth))}</p><p class="sub">Resúmenes cerrados y cuotas</p></div></div>`;
     return `${Store.profile === 'demo' ? topBanners() : ''}<div class="page-head"><div><h1>Deudas y tarjetas</h1><p class="sub">Lo que debés, a quién y cuándo vence</p></div>${tabs}</div>
       ${summary}${ui.debtTab === 'tarjetas' ? viewCards(debt.cards) : viewLoans(debt.loans)}`;
@@ -1682,11 +1692,12 @@ const App = (() => {
           <div class="row">${ls.closed ? '<span class="pill pill-pos">Cancelado</span>' : ls.overdue.length ? '<span class="pill pill-neg">Cuota vencida</span>' : ''}<button class="btn btn-ghost btn-icon" data-action="edit-loan" data-id="${l.id}" aria-label="Editar ${esc(l.creditor)}">${icon('edit')}</button></div></div>
         ${pct != null ? `<div><div class="row between small"><span class="muted">Capital cancelado</span><span class="amt">${pct}%</span></div><div class="progress mt-s" role="progressbar" aria-valuenow="${pct}" aria-valuemin="0" aria-valuemax="100" aria-label="Capital cancelado"><span style="width:${pct}%"></span></div></div>` : ''}
         <div class="split">
-          <div class="box"><p class="lbl">Saldo pendiente</p><p class="val">${esc(fmt(Math.max(0, ls.balance)))}</p><p class="sub">de ${esc(fmt(l.originalAmount || l.initialBalance))} original</p></div>
+          ${ls.balanceKnown ? `<div class="box"><p class="lbl">Saldo pendiente</p><p class="val">${esc(fmt(Math.max(0, ls.balance)))}</p><p class="sub">de ${esc(fmt(l.originalAmount || l.initialBalance))} original</p></div>` : `<div class="box"><p class="lbl">Saldo pendiente</p><p class="val warn">Sin informar</p><p class="sub"><button class="btn btn-ghost btn-s" style="padding:0;height:auto" data-action="edit-loan" data-id="${l.id}">Completar saldo y cuotas</button></p></div>`}
           <div class="box"><p class="lbl">Próximo vencimiento</p><p class="val ${nx && nx.date < today ? 'neg' : ''}">${nx ? esc(fmt(nx.amount)) : '—'}</p><p class="sub">${nx ? `${dl(nx.date)}, ${whenLabel(nx.date)}` : ls.closed ? 'Sin pagos pendientes' : 'Sin vencimiento definido'}</p></div>
         </div>
         ${l.installments ? `<div class="kv"><span class="k">Cuotas abonadas</span><span class="v">${ls.cuotasPaid} de ${l.installments}</span></div><div class="kv"><span class="k">Cuotas restantes</span><span class="v">${ls.remainingCount}</span></div>` : ''}
         <div class="kv"><span class="k">Cancelación estimada</span><span class="v">${ls.closed ? 'Cancelado' : ls.estCancel ? `${capital(Engine.periodLabel(D.period(ls.estCancel)))}${ls.scheduleEstimated ? ' (aprox.)' : ''}` : 'Sin datos suficientes'}</span></div>
+        ${l.installmentAmount && !l.installments ? `<div class="kv"><span class="k">Cuota</span><span class="v">${amt(l.installmentAmount)} ${Engine.FREQ[l.frequency]?.label.toLowerCase() || ''}</span></div>` : ''}
         ${ls.interestPaid ? `<div class="kv"><span class="k">Intereses pagados</span><span class="v">${amt(ls.interestPaid)}</span></div>` : ''}
         <div class="actions"><button class="btn btn-s btn-accent" data-action="pay-loan" data-id="${l.id}" ${ls.closed ? 'disabled' : ''}>Registrar pago</button></div>
         <details class="more"><summary>${icon('right')}Evolución y pagos</summary><div>
@@ -2328,7 +2339,7 @@ const App = (() => {
       body: `<div class="form-grid">
         <div class="form-grid two">${textField('creditor', 'Acreedor', l.creditor, { placeholder: 'Ej.: Banco, Juan, la empresa', autofocus: !existing })}
         ${selectField('creditorType', 'Tipo de acreedor', opts([['banco', 'Banco'], ['empresa', 'Empresa'], ['familiar', 'Familiar'], ['amigo', 'Amigo'], ['otro', 'Otro']], l.creditorType), l.creditorType)}</div>
-        <div class="form-grid two">${moneyField('originalAmount', 'Importe original', l.originalAmount)}${moneyField('initialBalance', 'Saldo pendiente hoy', l.initialBalance, { hint: hasPays ? 'Saldo al registrar el préstamo. Los pagos posteriores se descuentan solos.' : 'Lo que debés al día de hoy.' })}</div>
+        <div class="form-grid two">${moneyField('originalAmount', 'Importe original', l.originalAmount)}${moneyField('initialBalance', 'Saldo pendiente hoy', l.initialBalance, { hint: hasPays ? 'Saldo al registrar el préstamo. Los pagos posteriores se descuentan solos.' : 'Lo que debés al día de hoy. Si no lo sabés, dejalo vacío y cargá la cuota.' })}</div>
         <div class="form-grid two">
           ${fld('Cantidad de cuotas (opcional)', `<input class="input" type="number" min="1" max="600" name="installments" id="f-inst" value="${l.installments || ''}">`, { id: 'f-inst', hint: 'Vacío si no hay cuotas fijas.' })}
           ${fld('Cuotas ya pagadas', `<input class="input" type="number" min="0" max="600" name="paidBefore" id="f-pb" value="${l.paidBefore || 0}">`, { id: 'f-pb', hint: 'Antes de cargarlo acá.' })}
@@ -2358,7 +2369,8 @@ const App = (() => {
       onSubmit: (form, d) => {
         const errs = {};
         if (!d.creditor) errs.creditor = 'Indicá a quién le debés.';
-        const initialBalance = parseMoneyReq(d.initialBalance, errs, 'initialBalance');
+        const initialBalance = d.initialBalance ? parseMoneyReq(d.initialBalance, errs, 'initialBalance') : null;
+        if (initialBalance == null && !d.installmentAmount) errs.initialBalance = 'Cargá el saldo pendiente o, al menos, el valor de la cuota.';
         let originalAmount = parseMoneyOpt(d.originalAmount, errs, 'originalAmount');
         const installmentAmount = parseMoneyOpt(d.installmentAmount, errs, 'installmentAmount');
         const installments = d.installments ? parseInt(d.installments, 10) : null;
@@ -2369,15 +2381,15 @@ const App = (() => {
         if (d.nextDueDate && !D.valid(d.nextDueDate)) errs.nextDueDate = 'Fecha inválida.';
         const rate = d.rate ? parseFloat(d.rate.replace(',', '.')) : null;
         if (d.rate && !(rate >= 0 && rate < 1000)) errs.rate = 'Tasa inválida.';
-        if (originalAmount != null && initialBalance > 0 && originalAmount < initialBalance && !errs.originalAmount) errs.originalAmount = 'El importe original no puede ser menor al saldo pendiente.';
+        if (originalAmount != null && initialBalance != null && initialBalance > 0 && originalAmount < initialBalance && !errs.originalAmount) errs.originalAmount = 'El importe original no puede ser menor al saldo pendiente.';
         if (Object.keys(errs).length) return errs;
-        if (originalAmount == null) originalAmount = initialBalance;
+        if (originalAmount == null && initialBalance != null) originalAmount = initialBalance;
         const data = { creditor: d.creditor, creditorType: d.creditorType, originalAmount, initialBalance, installments, paidBefore, installmentAmount, frequency: d.frequency, nextDueDate: d.nextDueDate || null, rate, accountId: d.accountId, notes: d.notes, categoryId: catFor[d.creditorType] };
         if (existing) commit((s) => Object.assign(s.loans.find((x) => x.id === l.id), data), 'Préstamo actualizado', { undo: true });
         else commit((s) => {
           const id = Store.uid();
           s.loans.push({ id, ...data, createdDate: today, archived: false });
-          if (d.disbursed) s.txs.push({ id: Store.uid(), createdAt: Date.now(), kind: 'prestamo_recibido', loanId: id, amount: initialBalance, date: today, accountId: d.accountId, status: 'pagado', description: `Préstamo de ${d.creditor}` });
+          if (d.disbursed && initialBalance) s.txs.push({ id: Store.uid(), createdAt: Date.now(), kind: 'prestamo_recibido', loanId: id, amount: initialBalance, date: today, accountId: d.accountId, status: 'pagado', description: `Préstamo de ${d.creditor}` });
         }, 'Préstamo registrado');
       },
     });
@@ -2390,8 +2402,8 @@ const App = (() => {
     const defType = existing?.paymentType || (l.installmentAmount ? 'cuota' : 'parcial');
     const defAmount = existing ? existing.amount : (defType === 'cuota' ? (ls.next?.amount || l.installmentAmount) : null);
     const body = `<div class="form-grid">
-      <div class="callout">Saldo pendiente: <b>${esc(fmt(ls.balance))}</b>${ls.next ? `. Próxima cuota: ${esc(fmt(ls.next.amount))} el ${dl(ls.next.date)}${ls.next.date < today ? ' (vencida)' : ''}` : ''}.</div>
-      ${segField('paymentType', 'Tipo de pago', [['cuota', 'Cuota'], ['parcial', 'Parcial'], ['extraordinario', 'Extra'], ['cancelacion', 'Cancelación']], defType)}
+      <div class="callout">Saldo pendiente: <b>${ls.balanceKnown ? esc(fmt(ls.balance)) : 'sin informar'}</b>${ls.next ? `. Próxima cuota: ${esc(fmt(ls.next.amount))} el ${dl(ls.next.date)}${ls.next.date < today ? ' (vencida)' : ''}` : ''}.</div>
+      ${segField('paymentType', 'Tipo de pago', [['cuota', 'Cuota'], ['parcial', 'Parcial'], ['extraordinario', 'Extra'], ...(ls.balanceKnown ? [['cancelacion', 'Cancelación']] : [])], defType)}
       ${moneyField('amount', 'Importe pagado', defAmount, { big: true })}
       ${moneyField('interest', 'Interés incluido en el pago', existing ? existing.interest : null, { hint: 'Ajustalo al de tu comprobante.' })}
       <p class="callout info" data-show="split"></p>
@@ -2421,17 +2433,17 @@ const App = (() => {
         if (ty === 'cancelacion') { amount = ls.balance + (Money.parse(fI.value) || 0); fA.value = moneyInput(amount); }
         const interest = Money.parse(fI.value) || 0;
         const cap = (amount || 0) - interest;
-        $('[data-show="split"]', form).innerHTML = amount > 0 ? `Capital: <b>${esc(fmt(cap))}</b> reduce la deuda (queda ${esc(fmt(ls.balance - cap))}). Interés: <b>${esc(fmt(interest))}</b> cuenta como gasto. Tu disponible baja ${esc(fmt(amount))}.` : 'Ingresá el importe del pago.';
+        $('[data-show="split"]', form).innerHTML = amount > 0 ? `Capital: <b>${esc(fmt(cap))}</b> reduce la deuda${ls.balanceKnown ? ` (queda ${esc(fmt(ls.balance - cap))})` : ''}. Interés: <b>${esc(fmt(interest))}</b> cuenta como gasto. Tu disponible baja ${esc(fmt(amount))}.` : 'Ingresá el importe del pago.';
       },
       onSubmit: (form, d) => {
         const errs = {}; const amount = parseMoneyReq(d.amount, errs, 'amount');
         const interest = d.interest ? parseMoneyReq(d.interest, errs, 'interest', { allowZero: true }) : 0;
         if (!errs.amount && !errs.interest && interest > amount) errs.interest = 'El interés no puede superar el pago.';
-        if (!errs.amount && !errs.interest && amount - interest > ls.balance) errs.amount = `El capital (${fmt(amount - interest)}) supera el saldo pendiente (${fmt(ls.balance)}). Revisá el importe o el interés.`;
+        if (ls.balanceKnown && !errs.amount && !errs.interest && amount - interest > ls.balance) errs.amount = `El capital (${fmt(amount - interest)}) supera el saldo pendiente (${fmt(ls.balance)}). Revisá el importe o el interés.`;
         if (!D.valid(d.date)) errs.date = 'Fecha inválida.'; else if (d.date > today) errs.date = 'La fecha no puede ser futura.';
         if (Object.keys(errs).length) return errs;
         const tx = { kind: 'pago_prestamo', loanId: l.id, paymentType: d.paymentType, amount, interest, date: d.date, accountId: d.accountId, status: 'pagado', categoryId: l.categoryId, description: `${{ cuota: 'Cuota', parcial: 'Pago parcial', extraordinario: 'Pago extraordinario', cancelacion: 'Cancelación' }[d.paymentType]} ${l.creditor}` };
-        const closes = amount - interest === ls.balance;
+        const closes = ls.balanceKnown && amount - interest === ls.balance;
         if (existing) commit((s) => Object.assign(s.txs.find((x) => x.id === existing.id), tx), 'Pago actualizado', { undo: true });
         else commit((s) => s.txs.push({ id: Store.uid(), createdAt: Date.now(), ...tx }), closes ? `¡Deuda con ${l.creditor} cancelada!` : 'Pago registrado', { undo: true });
       },
